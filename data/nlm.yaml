@@ -1,0 +1,12 @@
+# NLM Table Detector
+# Train command: python nlm_train.py --img 1344 --batch xxx --epochs xxx --data data/nlm.yaml --weights '' --cfg models/nlm.yaml
+
+
+train: null
+val: null
+
+# number of classes
+nc: 1
+
+# class names
+names: [ 'table' ]
