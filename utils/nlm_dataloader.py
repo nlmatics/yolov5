@@ -249,10 +249,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     labeled = [label_type] + label_coords
 
                     page_labels.append(np.array(labeled))
-                    print("=" * 20)
-                    print(label)
-                    print(page_labels)
-
+                    
                 print(
                     f"{len(page_labels)} labels for document {file_idx}, page {page_idx+1}"
                 )
