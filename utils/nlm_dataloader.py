@@ -87,6 +87,7 @@ def create_dataloader(
     nw = min(
         [os.cpu_count() // world_size, batch_size if batch_size > 1 else 0, workers]
     )  # number of workers
+    nw = 1
     sampler = (
         torch.utils.data.distributed.DistributedSampler(dataset) if rank != -1 else None
     )

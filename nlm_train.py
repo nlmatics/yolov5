@@ -34,7 +34,7 @@ from utils.general import labels_to_class_weights, increment_path, labels_to_ima
     check_requirements, print_mutation, set_logging, one_cycle, colorstr
 from utils.google_utils import attempt_download
 from utils.loss import ComputeLoss
-from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
+from utils.nlm_plots import plot_images, plot_labels, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
 
@@ -340,7 +340,7 @@ def train(hyp, opt, device, tb_writer=None):
 
                 # Plot
                 if plots and ni < 3:
-                    f = save_dir / f'train_batch{ni}.png'  # filename
+                    f = save_dir / f'train_batch{ni}.jpg'  # filename
 
 
                     Thread(target=plot_images, args=(imgs, targets, paths, f), daemon=True).start()
@@ -349,7 +349,7 @@ def train(hyp, opt, device, tb_writer=None):
                     #     tb_writer.add_graph(torch.jit.trace(model, imgs, strict=False), [])  # add model graph
                 elif plots and ni == 10 and wandb_logger.wandb:
                     wandb_logger.log({"Mosaics": [wandb_logger.wandb.Image(str(x), caption=x.name) for x in
-                                                  save_dir.glob('train*.png') if x.exists()]})
+                                                  save_dir.glob('train*.jpg') if x.exists()]})
 
             # end batch ------------------------------------------------------------------------------------------------
         # end epoch ----------------------------------------------------------------------------------------------------
@@ -427,9 +427,9 @@ def train(hyp, opt, device, tb_writer=None):
     if rank in [-1, 0]:
         # Plots
         if plots:
-            plot_results(save_dir=save_dir)  # save as results.png
+            plot_results(save_dir=save_dir)  # save as results.jpg
             if wandb_logger.wandb:
-                files = ['results.png', 'confusion_matrix.png', *[f'{x}_curve.png' for x in ('F1', 'PR', 'P', 'R')]]
+                files = ['results.jpg', 'confusion_matrix.jpg', *[f'{x}_curve.jpg' for x in ('F1', 'PR', 'P', 'R')]]
                 wandb_logger.log({"Results": [wandb_logger.wandb.Image(str(save_dir / f), caption=f) for f in files
                                               if (save_dir / f).exists()]})
         # Test best.pt

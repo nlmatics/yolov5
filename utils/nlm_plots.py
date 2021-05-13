@@ -46,7 +46,7 @@ colors = Colors()  # create instance for 'from utils.plots import colors'
 
 
 def hist2d(x, y, n=100):
-    # 2d histogram used in labels.png and evolve.png
+    # 2d histogram used in labels.jpg and evolve.jpg
     xedges, yedges = np.linspace(x.min(), x.max(), n), np.linspace(y.min(), y.max(), n)
     hist, xedges, yedges = np.histogram2d(x, y, (xedges, yedges))
     xidx = np.clip(np.digitize(x, xedges) - 1, 0, hist.shape[0] - 1)
@@ -132,7 +132,7 @@ def plot_wh_methods():  # from utils.plots import *; plot_wh_methods()
     plt.ylabel("output")
     plt.grid()
     plt.legend()
-    fig.savefig("comparison.png", dpi=200)
+    fig.savefig("comparison.jpg", dpi=200)
 
 
 def output_to_target(output):
@@ -160,12 +160,9 @@ def plot_images(
     if isinstance(targets, torch.Tensor):
         targets = targets.cpu().numpy()
 
-    # use top-3 channel as image
-    images = images[:, :3, :, :]
-
-    # un-normalise
-    if np.max(images[0]) <= 1:
-        images *= 255
+    # # un-normalise
+    # if np.max(images[0]) <= 1:
+    #     images *= 255
 
     tl = 3  # line thickness
     tf = max(tl - 1, 1)  # font thickness
@@ -188,13 +185,16 @@ def plot_images(
         block_y = int(h * (i % ns))
 
         # use top-3 channel as image
-        if img.shape[-1] > 3:
-            img = img.copy()[:, :, :3]
+        img = img[:3, :, :] * 200
 
         # scale to 0-255
-        img = (img - img.min()) / img.max() * 255
+        img[img < 0] = 0
+        img[img > 255] = 255
+
         img = img.astype(np.uint8)
 
+        # CHW to HWC
+        img = img.transpose(1, 2, 0)
         if scale_factor < 1:
             img = cv2.resize(img, (w, h))
 
@@ -273,7 +273,7 @@ def plot_lr_scheduler(optimizer, scheduler, epochs=300, save_dir=""):
     plt.grid()
     plt.xlim(0, epochs)
     plt.ylim(0)
-    plt.savefig(Path(save_dir) / "LR.png", dpi=200)
+    plt.savefig(Path(save_dir) / "LR.jpg", dpi=200)
     plt.close()
 
 
@@ -286,12 +286,12 @@ def plot_test_txt():  # from utils.plots import *; plot_test()
     fig, ax = plt.subplots(1, 1, figsize=(6, 6), tight_layout=True)
     ax.hist2d(cx, cy, bins=600, cmax=10, cmin=0)
     ax.set_aspect("equal")
-    plt.savefig("hist2d.png", dpi=300)
+    plt.savefig("hist2d.jpg", dpi=300)
 
     fig, ax = plt.subplots(1, 2, figsize=(12, 6), tight_layout=True)
     ax[0].hist(cx, bins=600)
     ax[1].hist(cy, bins=600)
-    plt.savefig("hist1d.png", dpi=200)
+    plt.savefig("hist1d.jpg", dpi=200)
 
 
 def plot_targets_txt():  # from utils.plots import *; plot_targets_txt()
@@ -357,7 +357,7 @@ def plot_study_txt(path="", x=None):  # from utils.plots import *; plot_study_tx
     ax2.set_xlabel("GPU Speed (ms/img)")
     ax2.set_ylabel("COCO AP val")
     ax2.legend(loc="lower right")
-    plt.savefig(str(Path(path).name) + ".png", dpi=300)
+    plt.savefig(str(Path(path).name) + ".jpg", dpi=300)
 
 
 def plot_labels(labels, names=(), save_dir=Path(""), loggers=None):
@@ -447,8 +447,8 @@ def plot_evolution(
         if i % 5 != 0:
             plt.yticks([])
         print("%15s: %.3g" % (k, mu))
-    plt.savefig("evolve.png", dpi=200)
-    print("\nPlot saved as evolve.png")
+    plt.savefig("evolve.jpg", dpi=200)
+    print("\nPlot saved as evolve.jpg")
 
 
 def profile_idetection(start=0, stop=0, labels=(), save_dir=""):
@@ -495,7 +495,7 @@ def profile_idetection(start=0, stop=0, labels=(), save_dir=""):
             print("Warning: Plotting error for %s; %s" % (f, e))
 
     ax[1].legend()
-    plt.savefig(Path(save_dir) / "idetection_profile.png", dpi=200)
+    plt.savefig(Path(save_dir) / "idetection_profile.jpg", dpi=200)
 
 
 def plot_results_overlay(
@@ -533,7 +533,7 @@ def plot_results_overlay(
             ax[i].set_title(t[i])
             ax[i].legend()
             ax[i].set_ylabel(f) if i == 0 else None  # add filename
-        fig.savefig(f.replace(".txt", ".png"), dpi=200)
+        fig.savefig(f.replace(".txt", ".jpg"), dpi=200)
 
 
 def plot_results(start=0, stop=0, bucket="", id=(), labels=(), save_dir=""):
@@ -585,4 +585,4 @@ def plot_results(start=0, stop=0, bucket="", id=(), labels=(), save_dir=""):
             print("Warning: Plotting error for %s; %s" % (f, e))
 
     ax[1].legend()
-    fig.savefig(Path(save_dir) / "results.png", dpi=200)
+    fig.savefig(Path(save_dir) / "results.jpg", dpi=200)

@@ -126,9 +126,8 @@ class Model(nn.Module):
 
         assert imgs.shape[-1] == self.num_features
 
-        x = imgs
         # linear layer
-        x = self.feature_w(x)
+        x = self.feature_w(imgs)
 
         # sigmoid
         x = self.sigmoid(x)
