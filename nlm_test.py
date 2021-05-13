@@ -9,7 +9,7 @@ import torch
 import yaml
 from tqdm import tqdm
 
-from models.experimental import attempt_load
+from models.nlm_experimental import attempt_load
 from utils.datasets import create_dataloader
 from utils.general import coco80_to_coco91_class, check_dataset, check_file, check_img_size, check_requirements, \
     box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr
@@ -101,7 +101,7 @@ def test(data,
     for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
         img = img.to(device, non_blocking=True)
         img = img.half() if half else img.float()  # uint8 to fp16/32
-        img /= 255.0  # 0 - 255 to 0.0 - 1.0
+        # img /= 255.0  # 0 - 255 to 0.0 - 1.0
         targets = targets.to(device)
         # NLM BHWC
         nb, height, width, _ = img.shape  # batch size, channels, height, width
@@ -123,12 +123,13 @@ def test(data,
             out = non_max_suppression(out, conf_thres, iou_thres, labels=lb, multi_label=True, agnostic=single_cls)
             t1 += time_synchronized() - t
 
-        # nlm_features_to_yolo_image
+
         # NLM features in BHWC, yolo image in BCHW
-        img = img.transpose(3,1)
-        img = img.transpose(2,3)
-        # use top-3 channel as image
-        img = img[:, :3,:, :]
+        # BHWC => BCWH
+        img = img.transpose(1, 3)
+        # BCWH => BCHW
+        img = img.transpose(2, 3)
+
         # Statistics per image
         for si, pred in enumerate(out):
             labels = targets[targets[:, 0] == si, 1:]
@@ -219,9 +220,9 @@ def test(data,
 
         # Plot images
         if plots and batch_i < 3:
-            f = save_dir / f'test_batch{batch_i}_labels.jpg'  # labels
+            f = save_dir / f'test_batch{batch_i}_labels.png'  # labels
             Thread(target=plot_images, args=(img, targets, paths, f, names), daemon=True).start()
-            f = save_dir / f'test_batch{batch_i}_pred.jpg'  # predictions
+            f = save_dir / f'test_batch{batch_i}_pred.png'  # predictions
             Thread(target=plot_images, args=(img, output_to_target(out), paths, f, names), daemon=True).start()
 
     # Compute statistics
@@ -252,7 +253,7 @@ def test(data,
     if plots:
         confusion_matrix.plot(save_dir=save_dir, names=list(names.values()))
         if wandb_logger and wandb_logger.wandb:
-            val_batches = [wandb_logger.wandb.Image(str(f), caption=f.name) for f in sorted(save_dir.glob('test*.jpg'))]
+            val_batches = [wandb_logger.wandb.Image(str(f), caption=f.name) for f in sorted(save_dir.glob('test*.png'))]
             wandb_logger.log({"Validation": val_batches})
     if wandb_images:
         wandb_logger.log({"Bounding Box Debugger/Images": wandb_images})

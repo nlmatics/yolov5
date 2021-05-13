@@ -88,14 +88,14 @@ def train(hyp, opt, device, tb_writer=None):
         with torch_distributed_zero_first(rank):
             attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location=device)  # load checkpoint
-        model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        model = Model(opt.cfg or ckpt['model'].yaml, num_features=data_dict['num_features'], ch=3, nc=nc,  anchors=hyp.get('anchors')).to(device)  # create
         exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys
         state_dict = ckpt['model'].float().state_dict()  # to FP32
         state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(state_dict, strict=False)  # load
         logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
     else:
-        model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        model = Model(opt.cfg, num_features=data_dict['num_features'], ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
     with torch_distributed_zero_first(rank):
         check_dataset(data_dict)  # check
     # train_path = data_dict['train']
@@ -192,7 +192,7 @@ def train(hyp, opt, device, tb_writer=None):
 
     # Trainloader
     dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt,
-                                            hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
+                                            hyp=hyp, augment=False, cache=opt.cache_images, rect=opt.rect, rank=rank,
                                             world_size=opt.world_size, workers=opt.workers,
                                             image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '))
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
@@ -324,12 +324,11 @@ def train(hyp, opt, device, tb_writer=None):
                 if ema:
                     ema.update(model)
 
-            # nlm_features_to_yolo_image
             # NLM features in BHWC, yolo image in BCHW
-            imgs = imgs.transpose(3,1)
-            imgs = imgs.transpose(2,3)
-            # use top-3 channel as image
-            imgs = imgs[:, :3,:, :]
+            # BHWC => BCWH
+            imgs = imgs.transpose(1, 3)
+            # BCWH => BCHW
+            imgs = imgs.transpose(2, 3)
 
             # Print
             if rank in [-1, 0]:
@@ -341,7 +340,7 @@ def train(hyp, opt, device, tb_writer=None):
 
                 # Plot
                 if plots and ni < 3:
-                    f = save_dir / f'train_batch{ni}.jpg'  # filename
+                    f = save_dir / f'train_batch{ni}.png'  # filename
 
 
                     Thread(target=plot_images, args=(imgs, targets, paths, f), daemon=True).start()
@@ -350,7 +349,7 @@ def train(hyp, opt, device, tb_writer=None):
                     #     tb_writer.add_graph(torch.jit.trace(model, imgs, strict=False), [])  # add model graph
                 elif plots and ni == 10 and wandb_logger.wandb:
                     wandb_logger.log({"Mosaics": [wandb_logger.wandb.Image(str(x), caption=x.name) for x in
-                                                  save_dir.glob('train*.jpg') if x.exists()]})
+                                                  save_dir.glob('train*.png') if x.exists()]})
 
             # end batch ------------------------------------------------------------------------------------------------
         # end epoch ----------------------------------------------------------------------------------------------------

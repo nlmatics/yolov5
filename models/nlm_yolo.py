@@ -96,46 +96,50 @@ class Detect(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self, cfg, num_features=11, channels=3, num_classes=1, **kwargs):
+    def __init__(self, cfg, num_features=12, **kwargs):
         super().__init__()
 
         self.num_features = num_features
-        self.channels = channels
-        self.num_classes = num_classes
+        self.channels =  kwargs['ch']
+        self.num_classes = kwargs['nc']
 
         kwargs.pop("ch")
         kwargs.pop("nc")
 
-        self.yolo = YoloModel(cfg, ch=channels, nc=num_classes, **kwargs)
+        self.yolo = YoloModel(cfg, ch=self.channels, nc=self.num_classes, **kwargs)
         # self.yolo = self.yolo.autoshape()
         
         self.stride =self.yolo.stride
         self.model = self.yolo.model
+        self.names = self.yolo.names
 
         # BHWC
-        self.feature_w = nn.Linear(num_features, channels)
+        self.feature_w = nn.Linear(num_features, self.channels)
 
         # Non-linearity
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, imgs, **kwargs):
+        # imgs in BHWC
         for img in imgs:
             assert img.shape[0] % 32 == img.shape[1] % 32 == 0
 
         assert imgs.shape[-1] == self.num_features
 
         x = imgs
-
         # linear layer
         x = self.feature_w(x)
 
         # sigmoid
         x = self.sigmoid(x)
 
-        # BHWC to BCHW
+        # convert nlm features to yolo channels => BHWC to BCHW
+        # BHWC => BCWH
         x = x.transpose(1, 3)
-
+        # BCWH => BCHW
+        x = x.transpose(2, 3)
         # run yolo
+        # return self.yolo(x[:,:3,:,:])
         return self.yolo(x)
 
     def parse_yolo_output(self, logits, confident_threshold=0.5, iou_threshold=0.5):
