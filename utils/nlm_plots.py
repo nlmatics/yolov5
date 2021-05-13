@@ -160,6 +160,9 @@ def plot_images(
     if isinstance(targets, torch.Tensor):
         targets = targets.cpu().numpy()
 
+    # use top-3 channel as image
+    images = images[:, :3, :, :]
+
     # un-normalise
     if np.max(images[0]) <= 1:
         images *= 255
@@ -191,8 +194,6 @@ def plot_images(
         # scale to 0-255
         img = (img - img.min()) / img.max() * 255
         img = img.astype(np.uint8)
-
-        print(img, (w, h))
 
         if scale_factor < 1:
             img = cv2.resize(img, (w, h))
@@ -250,7 +251,7 @@ def plot_images(
         )
 
     if fname:
-        r = min(1280.0 / max(h, w) / ns, 1.0)  # ratio to limit image size
+        r = min(2688.0 / max(h, w) / ns, 1.0)  # ratio to limit image size
         mosaic = cv2.resize(
             mosaic, (int(ns * w * r), int(ns * h * r)), interpolation=cv2.INTER_AREA
         )
