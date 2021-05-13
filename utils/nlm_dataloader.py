@@ -137,7 +137,7 @@ class _RepeatSampler(object):
             yield from iter(self.sampler)
 
 
-def xyxy_to_training(xyxy, dim=(1344, 932)):
+def xyxy_to_training(xyxy, dim):
     x1, y1, x2, y2 = xyxy
 
     width = (x2 - x1) / dim[1]
@@ -145,7 +145,7 @@ def xyxy_to_training(xyxy, dim=(1344, 932)):
     midX = (x1 + x2) / 2 / dim[1]
     midY = (y1 + y2) / 2 / dim[0]
 
-    return [midX, midY,width, height]
+    return [midX, midY, width, height]
 
 
 @lru_cache(maxsize=1024)
@@ -188,6 +188,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.imgs = []
         self.img_files = []
         self.labels = []
+        self.dimensions = 0
 
         self.labels_map = {"table": 0}
 
@@ -202,7 +203,10 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             data = load_json(file_idx)
 
             # self.img_names.append(str(filename.name).split(".json")[0])
-            dimensions = len(data["metadata"]["features"])
+            if not self.dimensions:
+                self.dimensions = len(data["metadata"]["features"]) + 1
+            else:
+                assert self.dimensions == len(data["metadata"]["features"]) + 1
 
             pages = db["bboxes"].distinct(
                 "page_idx",
@@ -215,20 +219,26 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             for page_idx in pages:
                 tokens = data["data"][page_idx]
 
-                # HWC
-                features = np.zeros((1344, 960, dimensions), dtype=np.float32)
+                # HWC.
+                # We hard code the padding to 0, thus image must in square (H:1344,W:1344 by default)
+                features = np.zeros(
+                    (self.img_size, self.img_size - 32, self.dimensions),
+                    dtype=np.float32,
+                )
 
                 # make features, HWF
                 for token in tokens:
                     # x1, y1, x2, y2 = xyxy_to_training(token["position"]["xyxy"])
                     x1, y1, x2, y2 = token["position"]["xyxy"]
 
-                    # features[int(y1) : int(y2), int(x1) : int(x2), :] = 255
+                    # token position mask
+                    features[int(y1) : int(y2), int(x1) : int(x2), 0] = 1
 
                     for i, feature in enumerate(token["features"]):
-                        features[int(y1) : int(y2), int(x1) : int(x2), i] = feature
+                        features[int(y1) : int(y2), int(x1) : int(x2), i + 1] = feature
 
                 self.imgs.append(features)
+
                 self.img_files.append(f"file:{file_idx} page:{page_idx+1}")
 
                 # make labels
@@ -243,13 +253,13 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 ):
                     label_type = self.labels_map[label["block_type"]]
                     label_coords = xyxy_to_training(
-                        label["bbox"], dim=features.shape[:2]
+                        label["bbox"], dim=(self.img_size, self.img_size)
                     )
 
                     labeled = [label_type] + label_coords
 
                     page_labels.append(np.array(labeled))
-                    
+
                 print(
                     f"{len(page_labels)} labels for document {file_idx}, page {page_idx+1}"
                 )
@@ -276,20 +286,18 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         index = self.indices[index]  # linear, shuffled, or image_weights
         img = self.imgs[index]
 
-        # Letterbox
-        shape = self.img_size  # final letterboxed shape
-        # _, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
-
         # create shapes for plotting
-        h0, w0 = h, w = img.shape[:2]
-        # orignal (h,w), scale(h,w), padding(h,w)
+        h0, w0 = h, w = self.img_size, self.img_size
+
+        # orignal (h,w), (scale(h,w), padding(h,w)).
+        # NOTE: padding is hard coded to 0, thus we should have
+        # shape = (1344, 1344), ((1, 1), (0, 0))
         shapes = (h0, w0), ((h / h0, w / w0), (0, 0))  # for COCO mAP rescaling
 
         labels = self.labels[index]
         nL = len(labels)  # number of labels
         labels_out = torch.zeros((nL, 6))
         labels_out[:, 1:] = torch.from_numpy(labels)
-        # print(img.shape, labels_out.shape)
         return torch.from_numpy(img), labels_out, self.img_files[index], shapes
 
     @staticmethod
