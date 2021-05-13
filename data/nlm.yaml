@@ -8,5 +8,8 @@ val: null
 # number of classes
 nc: 1
 
+# number of features
+num_features: 12
+
 # class names
 names: [ 'table' ]
