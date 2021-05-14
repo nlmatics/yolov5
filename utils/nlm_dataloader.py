@@ -223,7 +223,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 # HWC.
                 # We hard code the padding to 0, thus image must in square (H:1344,W:1344 by default)
                 features = np.zeros(
-                    (self.img_size, self.img_size - 32, self.dimensions),
+                    (self.img_size, self.img_size, self.dimensions),
                     dtype=np.float32,
                 )
 
@@ -356,44 +356,91 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         return torch.stack(img4, 0), torch.cat(label4, 0), path4, shapes4
 
 
-def letterbox(
-    img,
-    new_shape=(640, 640),
-    color=(114, 114, 114),
-    auto=True,
-    scaleFill=False,
-    scaleup=True,
-    stride=32,
-):
-    # Resize and pad image while meeting stride-multiple constraints
-    shape = img.shape[:2]  # current shape [height, width]
-    if isinstance(new_shape, int):
-        new_shape = (new_shape, new_shape)
+class LoadNLMFeatures:  # for inference
+    def __init__(self, img_size=1344, stride=32):
+        self.img_size = img_size
 
-    # Scale ratio (new / old)
-    r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
-    if not scaleup:  # only scale down, do not scale up (for better test mAP)
-        r = min(r, 1.0)
+        self.mode = "image"
+        self.cap = None
+        self.dimensions = 0
+        self.imgs = []
+        self.img_files = []
 
-    # Compute padding
-    ratio = r, r  # width, height ratios
-    new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
-    dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
-    if auto:  # minimum rectangle
-        dw, dh = np.mod(dw, stride), np.mod(dh, stride)  # wh padding
-    elif scaleFill:  # stretch
-        dw, dh = 0.0, 0.0
-        new_unpad = (new_shape[1], new_shape[0])
-        ratio = new_shape[1] / shape[1], new_shape[0] / shape[0]  # width, height ratios
+        db_client = MongoClient(os.getenv("MONGO_HOST", "localhost"))
+        db = db_client[os.getenv("MONGO_DATABASE", "doc-store-dev")]
 
-    dw /= 2  # divide padding into 2 sides
-    dh /= 2
+        file_idxs = db["bboxes"].distinct("file_idx", {})
 
-    if shape[::-1] != new_unpad:  # resize
-        img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
-    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
-    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
-    img = cv2.copyMakeBorder(
-        img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color
-    )  # add border
-    return img, ratio, (dw, dh)
+        for file_idx in file_idxs:
+            data = load_json(file_idx)
+
+            # self.img_names.append(str(filename.name).split(".json")[0])
+            if not self.dimensions:
+                self.dimensions = len(data["metadata"]["features"]) + 1
+            else:
+                assert self.dimensions == len(data["metadata"]["features"]) + 1
+
+            pages = db["bboxes"].distinct(
+                "page_idx",
+                {
+                    "file_idx": file_idx,
+                },
+            )
+            
+            for page_idx in pages:
+                tokens = data["data"][page_idx]
+
+                # HWC.
+                # We hard code the padding to 0, thus image must in square (H:1344,W:1344 by default)
+                features = np.zeros(
+                    (self.img_size, self.img_size, self.dimensions),
+                    dtype=np.float32,
+                )
+
+                # make features, HWF
+                for token in tokens:
+                    # x1, y1, x2, y2 = xyxy_to_training(token["position"]["xyxy"])
+                    x1, y1, x2, y2 = token["position"]["xyxy"]
+
+                    # token position mask
+                    features[int(y1) : int(y2), int(x1) : int(x2), 0] = 1
+
+                    for i, feature in enumerate(token["features"]):
+                        features[int(y1) : int(y2), int(x1) : int(x2), i + 1] = feature
+
+                self.imgs.append(features)
+
+                self.img_files.append(f"{file_idx}_{page_idx+1}.jpg")
+
+                print(f"features loaded for document {file_idx}, page {page_idx+1}")
+
+
+    def __iter__(self):
+        self.count = 0
+        return self
+
+    def __next__(self):
+        if self.count == len(self.imgs):
+            raise StopIteration
+
+        # Read image
+        self.count += 1
+        img = self.imgs[self.count - 1]
+
+        # NLM features in BHWC, yolo image in BCHW
+        # # HWC => CWH
+        # img0 = img.transpose(2, 0, 1)
+
+        # use top-3 channel as image
+        img0 = img[:, :, :3] * 200
+
+        # scale to 0-255
+        img0[img0 < 0] = 0
+        img0[img0 > 255] = 255
+
+        img0 = img0.astype(np.uint8)
+
+        path = self.img_files[self.count - 1]
+        print(f"image {self.count}/{len(self.imgs)} {path}: ", end="")
+
+        return path, img, img0, self.cap
