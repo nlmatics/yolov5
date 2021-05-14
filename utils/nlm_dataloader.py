@@ -191,13 +191,18 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.labels = []
         self.dimensions = 0
 
-        self.labels_map = {"table": 0}
+        self.labels_map = {
+            "table": 0,
+            "header": 1,
+            "para": 2,
+        }
 
         db_client = MongoClient(os.getenv("MONGO_HOST", "localhost"))
         db = db_client[os.getenv("MONGO_DATABASE", "doc-store-dev")]
 
         file_idxs = db["bboxes"].distinct(
-            "file_idx", {"audited": True, "block_type": "table"}
+            "file_idx",
+            {"audited": True, "block_type": {"$in": list(self.labels_map.keys())}},
         )
 
         for file_idx in file_idxs:
@@ -214,7 +219,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 {
                     "file_idx": file_idx,
                     "audited": True,
-                    "block_type": "table",
+                    "block_type": {"$in": list(self.labels_map.keys())},
                 },
             )
             for page_idx in pages:
@@ -249,7 +254,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                         "file_idx": file_idx,
                         "page_idx": page_idx,
                         "audited": True,
-                        "block_type": "table",
+                        "block_type": {"$in": list(self.labels_map.keys())},
                     }
                 ):
                     label_type = self.labels_map[label["block_type"]]
@@ -386,7 +391,7 @@ class LoadNLMFeatures:  # for inference
                     "file_idx": file_idx,
                 },
             )
-            
+
             for page_idx in pages:
                 tokens = data["data"][page_idx]
 
@@ -413,7 +418,6 @@ class LoadNLMFeatures:  # for inference
                 self.img_files.append(f"{file_idx}_{page_idx+1}.jpg")
 
                 print(f"features loaded for document {file_idx}, page {page_idx+1}")
-
 
     def __iter__(self):
         self.count = 0

@@ -6,10 +6,10 @@ train: null
 val: null
 
 # number of classes
-nc: 1
+nc: 3
 
 # number of features
 num_features: 12
 
 # class names
-names: [ 'table' ]
+names: [ 'table', 'header', 'para']
