@@ -48,6 +48,62 @@ for orientation in ExifTags.TAGS.keys():
         break
 
 
+def correct_box(img, xyxy, threshold=None):
+    def _correct_box(img, ax, fixed_ax_1, fixed_ax_2, pad_1):
+        limit = img.shape[1]
+        expanded = shrinked = ax
+        while True:
+            if (
+                0 < expanded < limit + pad_1
+                and np.count_nonzero(img[fixed_ax_1:fixed_ax_2, expanded - pad_1]) == 0
+                and np.count_nonzero(img[fixed_ax_1:fixed_ax_2, expanded]) != 0
+            ):
+                return expanded
+            if (
+                0 < shrinked < limit + pad_1
+                and np.count_nonzero(img[fixed_ax_1:fixed_ax_2, shrinked - pad_1]) == 0
+                and np.count_nonzero(img[fixed_ax_1:fixed_ax_2, shrinked]) != 0
+            ):
+                return shrinked
+            expanded -= 1
+            shrinked += 1
+
+            if (expanded <= 0 and shrinked >= limit) or (
+                expanded <= 0 and shrinked >= limit
+            ):
+                raise ValueError("Can not find the box in the image")
+
+    def _check_box(img, xyxy, threshold=0.1):
+        y1, x1, y2, x2 = xyxy
+
+        boxed_img = img[y1:y2, x1:x2]
+
+        return (
+            np.count_nonzero(boxed_img) / (boxed_img.shape[0] * boxed_img.shape[1])
+            > threshold
+        )
+
+    if len(img.shape) == 3:
+        img = img[:, :, 0]
+
+    assert len(img.shape) == 2
+
+    x1, y1, x2, y2 = [int(x) for x in xyxy]
+
+    x1 = _correct_box(img, x1, y1, y2, 1)
+
+    x2 = _correct_box(img, x2, y1, y2, -1)
+
+    y1 = _correct_box(img.transpose(1, 0), y1, x1, x2, 1)
+
+    y2 = _correct_box(img.transpose(1, 0), y2, x1, x2, -1)
+
+    if threshold:
+        valided = _check_box(img, [y1, x1, y2, x2])
+
+    return x1, y1, x2, y2
+
+
 def create_dataloader(
     path,
     imgsz,
@@ -65,6 +121,7 @@ def create_dataloader(
     image_weights=False,
     quad=False,
     prefix="",
+    random_seed=None,
 ):
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
     with torch_distributed_zero_first(rank):
@@ -81,6 +138,7 @@ def create_dataloader(
             pad=pad,
             image_weights=image_weights,
             prefix=prefix,
+            random_seed=random_seed,
         )
 
     batch_size = min(batch_size, len(dataset))
@@ -166,7 +224,7 @@ def load_json(file_idx, cache_folder="./nlm_features/"):
 class LoadImagesAndLabels(Dataset):  # for training/testing
     def __init__(
         self,
-        path,
+        split,
         img_size=1344,
         batch_size=16,
         augment=False,
@@ -178,6 +236,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         stride=32,
         pad=0.0,
         prefix="",
+        random_seed=None,
     ):
         self.img_size = img_size
         self.augment = augment
@@ -185,7 +244,9 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.image_weights = image_weights
 
         self.stride = stride
-        self.path = path
+        self.split = split
+        self.random = np.random.RandomState(random_seed)
+
         self.imgs = []
         self.img_files = []
         self.labels = []
@@ -193,8 +254,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
         self.labels_map = {
             "table": 0,
-            "header": 1,
-            "para": 2,
+            # "header": 1,
+            # "para": 2,
         }
 
         db_client = MongoClient(os.getenv("MONGO_HOST", "localhost"))
@@ -206,7 +267,11 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         )
 
         for file_idx in file_idxs:
-            data = load_json(file_idx)
+            try:
+                data = load_json(file_idx)
+            except:
+                print(f"error loading {file_idx}")
+                continue
 
             # self.img_names.append(str(filename.name).split(".json")[0])
             if not self.dimensions:
@@ -223,6 +288,12 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 },
             )
             for page_idx in pages:
+                if self.split:
+                    if isinstance(self.split, float) and 0 <= self.split <= 1:
+                        if self.random.random() >= self.split:
+                            print("skipping current page by random")
+                            continue
+
                 tokens = data["data"][page_idx]
 
                 # HWC.
@@ -235,17 +306,13 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 # make features, HWF
                 for token in tokens:
                     # x1, y1, x2, y2 = xyxy_to_training(token["position"]["xyxy"])
-                    x1, y1, x2, y2 = token["position"]["xyxy"]
+                    x1, y1, x2, y2 = [round(x) for x in token["position"]["xyxy"]]
 
                     # token position mask
-                    features[int(y1) : int(y2), int(x1) : int(x2), 0] = 1
+                    features[y1:y2, x1:x2, 0] = 1
 
                     for i, feature in enumerate(token["features"]):
-                        features[int(y1) : int(y2), int(x1) : int(x2), i + 1] = feature
-
-                self.imgs.append(features)
-
-                self.img_files.append(f"file:{file_idx} page:{page_idx+1}")
+                        features[y1:y2, x1:x2, i + 1] = feature
 
                 # make labels
                 page_labels = []
@@ -258,18 +325,34 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     }
                 ):
                     label_type = self.labels_map[label["block_type"]]
+
+                    try:
+                        xyxy = correct_box(features, label["bbox"])
+                        print([round(x) for x in label["bbox"]], xyxy)
+                    except Exception:
+                        continue
+
                     label_coords = xyxy_to_training(
-                        label["bbox"], dim=(self.img_size, self.img_size)
+                        xyxy, dim=(self.img_size, self.img_size)
                     )
 
                     labeled = [label_type] + label_coords
 
                     page_labels.append(np.array(labeled))
 
-                print(
-                    f"{len(page_labels)} labels for document {file_idx}, page {page_idx+1}"
-                )
-                self.labels.append(page_labels)
+                if page_labels:
+                    self.imgs.append(features)
+
+                    self.img_files.append(f"file:{file_idx} page:{page_idx+1}")
+
+                    self.labels.append(page_labels)
+                    print(
+                        f"{len(page_labels)} labels for document {file_idx}, page {page_idx+1}"
+                    )
+
+        print(
+            f"Found {len(self.imgs)} images with {sum([len(x) for x in self.labels])} labels"
+        )
 
         # label found, label missing, label empty, label corrupted, total label.
         self.shapes = np.array(
