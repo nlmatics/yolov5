@@ -13,7 +13,7 @@ from pathlib import Path
 from threading import Thread
 from pymongo import MongoClient
 from functools import lru_cache
-
+from xxhash import xxh32_intdigest
 
 import json
 import cv2
@@ -121,7 +121,6 @@ def create_dataloader(
     image_weights=False,
     quad=False,
     prefix="",
-    random_seed=None,
 ):
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
     with torch_distributed_zero_first(rank):
@@ -138,7 +137,6 @@ def create_dataloader(
             pad=pad,
             image_weights=image_weights,
             prefix=prefix,
-            random_seed=random_seed,
         )
 
     batch_size = min(batch_size, len(dataset))
@@ -236,7 +234,6 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         stride=32,
         pad=0.0,
         prefix="",
-        random_seed=None,
     ):
         self.img_size = img_size
         self.augment = augment
@@ -245,7 +242,6 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
         self.stride = stride
         self.split = split
-        self.random = np.random.RandomState(random_seed)
 
         self.imgs = []
         self.img_files = []
@@ -288,10 +284,15 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 },
             )
             for page_idx in pages:
-                if self.split:
-                    if isinstance(self.split, float) and 0 <= self.split <= 1:
-                        if self.random.random() >= self.split:
-                            print("skipping current page by random")
+                if self.split and isinstance(self.split, int):
+                    h = xxh32_intdigest(f"{file_idx}-{page_idx}")
+                    if self.split > 5:
+                        if h % 10 >= self.split:
+                            print("skipping current page for training")
+                            continue
+                    else:
+                        if h % 10 < (10 - self.split):
+                            print("skipping current page for testing")
                             continue
 
                 tokens = data["data"][page_idx]
@@ -328,7 +329,6 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
                     try:
                         xyxy = correct_box(features, label["bbox"])
-                        print([round(x) for x in label["bbox"]], xyxy)
                     except Exception:
                         continue
 
@@ -457,10 +457,15 @@ class LoadNLMFeatures:  # for inference
         db_client = MongoClient(os.getenv("MONGO_HOST", "localhost"))
         db = db_client[os.getenv("MONGO_DATABASE", "doc-store-dev")]
 
-        file_idxs = db["bboxes"].distinct("file_idx", {})
+        file_idxs = db["bboxes"].distinct("file_idx", {"block_type": "table"})
 
         for file_idx in file_idxs:
-            data = load_json(file_idx)
+            if len(self.imgs) >= 1000:
+                break
+            try:
+                data = load_json(file_idx)
+            except Exception:
+                continue
 
             # self.img_names.append(str(filename.name).split(".json")[0])
             if not self.dimensions:
@@ -470,9 +475,7 @@ class LoadNLMFeatures:  # for inference
 
             pages = db["bboxes"].distinct(
                 "page_idx",
-                {
-                    "file_idx": file_idx,
-                },
+                {"file_idx": file_idx, "block_type": "table", "audited": False},
             )
 
             for page_idx in pages:
@@ -488,13 +491,13 @@ class LoadNLMFeatures:  # for inference
                 # make features, HWF
                 for token in tokens:
                     # x1, y1, x2, y2 = xyxy_to_training(token["position"]["xyxy"])
-                    x1, y1, x2, y2 = token["position"]["xyxy"]
+                    x1, y1, x2, y2 = [round(x) for x in token["position"]["xyxy"]]
 
                     # token position mask
-                    features[int(y1) : int(y2), int(x1) : int(x2), 0] = 1
+                    features[y1:y2, x1:x2, 0] = 1
 
                     for i, feature in enumerate(token["features"]):
-                        features[int(y1) : int(y2), int(x1) : int(x2), i + 1] = feature
+                        features[y1:y2, x1:x2, i + 1] = feature
 
                 self.imgs.append(features)
 

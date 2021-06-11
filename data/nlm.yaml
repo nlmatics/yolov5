@@ -1,9 +1,8 @@
 # NLM Table Detector
 # Train command: python nlm_train.py --img 1344 --batch xxx --epochs xxx --data data/nlm.yaml --weights '' --cfg models/nlm.yaml
 
-train: 0.9
-val: 0.1
-random_seed: 0
+train: 9
+val: 1
 
 # number of features
 num_features: 12
@@ -12,6 +11,7 @@ num_features: 12
 nc: 1
 # class names
 names: ["table"]
+
 ## number of classes
 #nc: 3
 ## class names

@@ -100,16 +100,16 @@ class Model(nn.Module):
         super().__init__()
 
         self.num_features = num_features
-        self.channels =  kwargs['ch']
-        self.num_classes = kwargs['nc']
+        self.channels = kwargs["ch"]
+        self.num_classes = kwargs["nc"]
 
         kwargs.pop("ch")
         kwargs.pop("nc")
 
         self.yolo = YoloModel(cfg, ch=self.channels, nc=self.num_classes, **kwargs)
         # self.yolo = self.yolo.autoshape()
-        
-        self.stride =self.yolo.stride
+
+        self.stride = self.yolo.stride
         self.model = self.yolo.model
         self.names = self.yolo.names
 
@@ -119,19 +119,40 @@ class Model(nn.Module):
         # Non-linearity
         self.sigmoid = nn.Sigmoid()
 
+    # def forward(self, imgs, **kwargs):
+    #     # imgs in BHWC
+    #     for img in imgs:
+    #         assert img.shape[0] % 32 == img.shape[1] % 32 == 0
+
+    #     assert imgs.shape[-1] == self.num_features
+
+    #     # linear layer
+    #     x = self.feature_w(imgs)
+
+    #     # sigmoid
+    #     x = self.sigmoid(x)
+
+    #     # convert nlm features to yolo channels => BHWC to BCHW
+    #     # BHWC => BCWH
+    #     x = x.transpose(1, 3)
+    #     # BCWH => BCHW
+    #     x = x.transpose(2, 3)
+    #     # run yolo
+    #     # return self.yolo(x[:,:3,:,:])
+    #     return self.yolo(x)
+
     def forward(self, imgs, **kwargs):
         # imgs in BHWC
         for img in imgs:
             assert img.shape[0] % 32 == img.shape[1] % 32 == 0
 
-        assert imgs.shape[-1] == self.num_features
+        # use token mask as features only
+        x = imgs[:, :, :, :1]
+        x = torch.cat([x,x,x],dim=3)
 
-        # linear layer
-        x = self.feature_w(imgs)
-
-        # sigmoid
-        x = self.sigmoid(x)
-
+        # normalize to 0-1
+        x = x - x.min()
+        x = x / x.max()
         # convert nlm features to yolo channels => BHWC to BCHW
         # BHWC => BCWH
         x = x.transpose(1, 3)
