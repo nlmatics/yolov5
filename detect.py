@@ -7,6 +7,7 @@ Usage:
 import argparse
 import sys
 import time
+import pickle
 from pathlib import Path
 
 import cv2
@@ -65,6 +66,7 @@ def run(weights='yolov5s.pt',  # model.pt path(s)
 
     # Load model
     w = weights[0] if isinstance(weights, list) else weights
+    scaler_path = w[:w.rfind("/")+1]+"scaler.pickle"
     classify, pt, onnx = False, w.endswith('.pt'), w.endswith('.onnx')  # inference type
     stride, names = 64, [f'class{i}' for i in range(1000)]  # assign defaults
     if pt:
@@ -86,16 +88,18 @@ def run(weights='yolov5s.pt',  # model.pt path(s)
     if webcam:
         view_img = check_imshow()
         cudnn.benchmark = True  # set True to speed up constant image size inference
-        dataset = LoadStreams(source, img_size=imgsz, stride=stride)
+        dataset = LoadStreams(img_size=imgsz, stride=stride)
         bs = len(dataset)  # batch_size
     else:
-        dataset = LoadImages(source, img_size=imgsz, stride=stride)
+        with open(scaler_path, "rb") as f:
+            scaler = pickle.load(f)
+        dataset = LoadImages(img_size=imgsz, stride=stride, scaler=scaler)
         bs = 1  # batch_size
     vid_path, vid_writer = [None] * bs, [None] * bs
 
     # Run inference
-    if pt and device.type != 'cpu':
-        model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
+    # if pt and device.type != 'cpu':
+    #     model(torch.zeros(1, 12, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
     t0 = time.time()
     for path, img, im0s, vid_cap in dataset:
         if pt:

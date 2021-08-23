@@ -12,6 +12,7 @@ from itertools import repeat
 from multiprocessing.pool import ThreadPool, Pool
 from pathlib import Path
 from threading import Thread
+from sklearn import preprocessing
 
 import cv2
 import numpy as np
@@ -21,7 +22,9 @@ import yaml
 from PIL import Image, ExifTags
 from torch.utils.data import Dataset
 from tqdm import tqdm
+from nlm_utils.storage import file_storage
 
+from pymongo import MongoClient
 from utils.augmentations import Albumentations, augment_hsv, copy_paste, letterbox, mixup, random_perspective
 from utils.general import check_requirements, check_file, check_dataset, xywh2xyxy, xywhn2xyxy, xyxy2xywhn, \
     xyn2xy, segments2boxes, clean_str
@@ -38,6 +41,85 @@ for orientation in ExifTags.TAGS.keys():
     if ExifTags.TAGS[orientation] == 'Orientation':
         break
 
+
+def xyxy_to_training(xyxy, dim):
+    x1, y1, x2, y2 = xyxy
+
+    width = (x2 - x1) / dim[1]
+    height = (y2 - y1) / dim[0]
+    midX = (x1 + x2) / 2 / dim[1]
+    midY = (y1 + y2) / 2 / dim[0]
+
+    return [midX, midY, width, height]
+
+
+def load_json(file_idx, cache_folder="./nlm_features/"):
+    filename = f"{cache_folder}/{file_idx}.json"
+    if not os.path.exists(filename):
+        file_storage.download_document(
+            f"bbox/features/{file_idx}.json",
+            dest_file_location=f"{cache_folder}/{file_idx}.json",
+        )
+
+    with open(str(filename)) as f:
+        data = json.load(f)
+    return data
+
+
+def correct_box(img, xyxy, threshold=None):
+    def _correct_box(img, ax, fixed_ax_1, fixed_ax_2, pad_1):
+        limit = img.shape[1]
+        expanded = shrinked = ax
+        while True:
+            if (
+                0 < expanded < limit + pad_1
+                and np.count_nonzero(img[fixed_ax_1:fixed_ax_2, expanded - pad_1]) == 0
+                and np.count_nonzero(img[fixed_ax_1:fixed_ax_2, expanded]) != 0
+            ):
+                return expanded
+            if (
+                0 < shrinked < limit + pad_1
+                and np.count_nonzero(img[fixed_ax_1:fixed_ax_2, shrinked - pad_1]) == 0
+                and np.count_nonzero(img[fixed_ax_1:fixed_ax_2, shrinked]) != 0
+            ):
+                return shrinked
+            expanded -= 1
+            shrinked += 1
+
+            if (expanded <= 0 and shrinked >= limit) or (
+                expanded <= 0 and shrinked >= limit
+            ):
+                raise ValueError("Can not find the box in the image")
+
+    def _check_box(img, xyxy, threshold=0.1):
+        y1, x1, y2, x2 = xyxy
+
+        boxed_img = img[y1:y2, x1:x2]
+
+        return (
+            np.count_nonzero(boxed_img) / (boxed_img.shape[0] * boxed_img.shape[1])
+            > threshold
+        )
+
+    if len(img.shape) == 3:
+        img = img[:, :, 0]
+
+    assert len(img.shape) == 2
+
+    x1, y1, x2, y2 = [int(x) for x in xyxy]
+
+    x1 = _correct_box(img, x1, y1, y2, 1)
+
+    x2 = _correct_box(img, x2, y1, y2, -1)
+
+    y1 = _correct_box(img.transpose(1, 0), y1, x1, x2, 1)
+
+    y2 = _correct_box(img.transpose(1, 0), y2, x1, x2, -1)
+
+    if threshold:
+        valided = _check_box(img, [y1, x1, y2, x2])
+
+    return x1, y1, x2, y2
 
 def get_hash(paths):
     # Returns a single hash value of a list of paths (files or dirs)
@@ -152,83 +234,110 @@ class _RepeatSampler(object):
 
 
 class LoadImages:  # for inference
-    def __init__(self, path, img_size=640, stride=32):
-        p = str(Path(path).absolute())  # os-agnostic absolute path
-        if '*' in p:
-            files = sorted(glob.glob(p, recursive=True))  # glob
-        elif os.path.isdir(p):
-            files = sorted(glob.glob(os.path.join(p, '*.*')))  # dir
-        elif os.path.isfile(p):
-            files = [p]  # files
-        else:
-            raise Exception(f'ERROR: {p} does not exist')
-
-        images = [x for x in files if x.split('.')[-1].lower() in IMG_FORMATS]
-        videos = [x for x in files if x.split('.')[-1].lower() in VID_FORMATS]
-        ni, nv = len(images), len(videos)
-
+    def __init__(self, img_size=1344, stride=32, scaler=None):
         self.img_size = img_size
-        self.stride = stride
-        self.files = images + videos
-        self.nf = ni + nv  # number of files
-        self.video_flag = [False] * ni + [True] * nv
-        self.mode = 'image'
-        if any(videos):
-            self.new_video(videos[0])  # new video
-        else:
-            self.cap = None
-        assert self.nf > 0, f'No images or videos found in {p}. ' \
-                            f'Supported formats are:\nimages: {IMG_FORMATS}\nvideos: {VID_FORMATS}'
+        self.scaler = scaler
+        self.mode = "image"
+        self.cap = None
+        self.dimensions = 0
+        self.imgs = []
+        self.img_files = []
+
+        db_client = MongoClient(os.getenv("MONGO_HOST", "localhost"))
+        db = db_client[os.getenv("MONGO_DATABASE", "doc-store-dev")]
+
+        # file_idxs = db["bboxes"].distinct("file_idx", {"block_type": "table", "audited": True})
+        file_idxs = db["document"].distinct("id", {"workspace_id": "704dc2bc"})
+        
+
+        for file_idx in file_idxs:
+            if len(self.imgs) >= 1000:
+                break
+            try:
+                data = load_json(file_idx)
+            except Exception:
+                continue
+
+            # self.img_names.append(str(filename.name).split(".json")[0])
+            if not self.dimensions:
+                self.dimensions = len(data["metadata"]["features"]) + 1
+            else:
+                assert self.dimensions == len(data["metadata"]["features"]) + 1
+
+            pages = db["bboxes"].distinct(
+                "page_idx",
+                {"file_idx": file_idx, "block_type": "table", "audited": False},
+            )
+
+            for page_idx in pages:
+                tokens = data["data"][page_idx]
+
+                # HWC.
+                # We hard code the padding to 0, thus image must in square (H:1344,W:1344 by default)
+                features = np.zeros(
+                    (self.img_size, self.img_size, self.dimensions),
+                    dtype=np.float32,
+                )
+
+                # make features, HWF
+                for token in tokens:
+                    # x1, y1, x2, y2 = xyxy_to_training(token["position"]["xyxy"])
+                    x1, y1, x2, y2 = [round(x) for x in token["position"]["xyxy"]]
+
+                    # token position mask
+                    features[y1:y2, x1:x2, 0] = 1
+
+                    for i, feature in enumerate(token["features"]):
+                        features[y1:y2, x1:x2, i + 1] = feature
+
+                self.imgs.append(features)
+
+                self.img_files.append(f"{file_idx}_{page_idx+1}.jpg")
+
+                print(f"features loaded for document {file_idx}, page {page_idx+1}")
 
     def __iter__(self):
         self.count = 0
         return self
 
     def __next__(self):
-        if self.count == self.nf:
+        if self.count == len(self.imgs):
             raise StopIteration
-        path = self.files[self.count]
 
-        if self.video_flag[self.count]:
-            # Read video
-            self.mode = 'video'
-            ret_val, img0 = self.cap.read()
-            if not ret_val:
-                self.count += 1
-                self.cap.release()
-                if self.count == self.nf:  # last video
-                    raise StopIteration
-                else:
-                    path = self.files[self.count]
-                    self.new_video(path)
-                    ret_val, img0 = self.cap.read()
+        # Read image
+        self.count += 1
+        img = self.imgs[self.count - 1]
 
-            self.frame += 1
-            print(f'video {self.count + 1}/{self.nf} ({self.frame}/{self.frames}) {path}: ', end='')
+        img = self.scaler.transform(img.reshape(-1,12)).reshape(1344,1344,12)
+        # NLM features in BHWC, yolo image in BCHW
+        # # HWC => CWH
+        # img0 = img.transpose(2, 0, 1)
 
-        else:
-            # Read image
-            self.count += 1
-            img0 = cv2.imread(path)  # BGR
-            assert img0 is not None, 'Image Not Found ' + path
-            print(f'image {self.count}/{self.nf} {path}: ', end='')
+        # use top-3 channel as image
+        img0 = img[:, :, :3] * 255
 
-        # Padded resize
-        img = letterbox(img0, self.img_size, stride=self.stride)[0]
+        img = img.transpose(2, 0, 1)
+        # # scale to 0-255
+        # img0[img0 < 0] = 0
+        # img0[img0 > 255] = 255
 
-        # Convert
-        img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
-        img = np.ascontiguousarray(img)
+        # img0 = img0.astype(np.uint8)
 
+        path = self.img_files[self.count - 1]
+        print(f"image {self.count}/{len(self.imgs)} {path}: ", end="")
+
+        # BHWC => BCWH
+        # x = torch.from_numpy(img)
+        # x = x.transpose(0, 2)
+        # # BCWH => BCHW
+        # x = x.transpose(1, 2)
+
+        # print(x[1].shape)
+        # normalize to 0-1
+        # img = x * 255
+        img = img * 255
+        # print("shape", img.shape, img0.shape)
         return path, img, img0, self.cap
-
-    def new_video(self, path):
-        self.frame = 0
-        self.cap = cv2.VideoCapture(path)
-        self.frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    def __len__(self):
-        return self.nf  # number of files
 
 
 class LoadWebcam:  # for inference
@@ -360,237 +469,196 @@ def img2label_paths(img_paths):
 
 
 class LoadImagesAndLabels(Dataset):  # for training/testing
-    def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
-                 cache_images=False, single_cls=False, stride=32, pad=0.0, prefix=''):
+    def __init__(
+        self,
+        split,
+        img_size=1344,
+        batch_size=16,
+        augment=False,
+        hyp=None,
+        rect=False,
+        image_weights=False,
+        cache_images=False,
+        single_cls=False,
+        stride=32,
+        pad=0.0,
+        prefix="",
+    ):
         self.img_size = img_size
         self.augment = augment
         self.hyp = hyp
         self.image_weights = image_weights
-        self.rect = False if image_weights else rect
-        self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
-        self.mosaic_border = [-img_size // 2, -img_size // 2]
+
         self.stride = stride
-        self.path = path
-        self.albumentations = Albumentations() if augment else None
+        self.split = split
 
-        try:
-            f = []  # image files
-            for p in path if isinstance(path, list) else [path]:
-                p = Path(p)  # os-agnostic
-                if p.is_dir():  # dir
-                    f += glob.glob(str(p / '**' / '*.*'), recursive=True)
-                    # f = list(p.rglob('**/*.*'))  # pathlib
-                elif p.is_file():  # file
-                    with open(p, 'r') as t:
-                        t = t.read().strip().splitlines()
-                        parent = str(p.parent) + os.sep
-                        f += [x.replace('./', parent) if x.startswith('./') else x for x in t]  # local to global path
-                        # f += [p.parent / x.lstrip(os.sep) for x in t]  # local to global path (pathlib)
-                else:
-                    raise Exception(f'{prefix}{p} does not exist')
-            self.img_files = sorted([x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in IMG_FORMATS])
-            # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in img_formats])  # pathlib
-            assert self.img_files, f'{prefix}No images found'
-        except Exception as e:
-            raise Exception(f'{prefix}Error loading data from {path}: {e}\nSee {HELP_URL}')
+        self.imgs = []
+        self.img_files = []
+        self.labels = []
+        self.dimensions = 0
 
-        # Check cache
-        self.label_files = img2label_paths(self.img_files)  # labels
-        cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')
-        try:
-            cache, exists = np.load(cache_path, allow_pickle=True).item(), True  # load dict
-            assert cache['version'] == 0.4 and cache['hash'] == get_hash(self.label_files + self.img_files)
-        except:
-            cache, exists = self.cache_labels(cache_path, prefix), False  # cache
+        self.labels_map = {
+            "table": 0,
+            # "header": 1,
+            # "para": 2,
+        }
 
-        # Display cache
-        nf, nm, ne, nc, n = cache.pop('results')  # found, missing, empty, corrupted, total
-        if exists:
-            d = f"Scanning '{cache_path}' images and labels... {nf} found, {nm} missing, {ne} empty, {nc} corrupted"
-            tqdm(None, desc=prefix + d, total=n, initial=n)  # display cache results
-            if cache['msgs']:
-                logging.info('\n'.join(cache['msgs']))  # display warnings
-        assert nf > 0 or not augment, f'{prefix}No labels in {cache_path}. Can not train without labels. See {HELP_URL}'
+        db_client = MongoClient(os.getenv("MONGO_HOST", "localhost"))
+        db = db_client[os.getenv("MONGO_DATABASE", "doc-store-dev")]
 
-        # Read cache
-        [cache.pop(k) for k in ('hash', 'version', 'msgs')]  # remove items
-        labels, shapes, self.segments = zip(*cache.values())
-        self.labels = list(labels)
-        self.shapes = np.array(shapes, dtype=np.float64)
-        self.img_files = list(cache.keys())  # update
-        self.label_files = img2label_paths(cache.keys())  # update
-        if single_cls:
-            for x in self.labels:
-                x[:, 0] = 0
+        file_idxs = db["bboxes"].distinct(
+            "file_idx",
+            {"audited": True, "block_type": {"$in": list(self.labels_map.keys())}},
+        )
 
-        n = len(shapes)  # number of images
+        for file_idx in file_idxs:
+            try:
+                data = load_json(file_idx)
+            except:
+                print(f"error loading {file_idx}")
+                continue
+
+            # self.img_names.append(str(filename.name).split(".json")[0])
+            if not self.dimensions:
+                self.dimensions = len(data["metadata"]["features"]) + 1
+            else:
+                assert self.dimensions == len(data["metadata"]["features"]) + 1
+
+            pages = db["bboxes"].distinct(
+                "page_idx",
+                {
+                    "file_idx": file_idx,
+                    "audited": True,
+                    "block_type": {"$in": list(self.labels_map.keys())},
+                },
+            )
+            for page_idx in pages:
+                if self.split and isinstance(self.split, int):
+                    h = xxh32_intdigest(f"{file_idx}-{page_idx}")
+                    if self.split > 5:
+                        if h % 10 >= self.split:
+                            print("skipping current page for training")
+                            continue
+                    else:
+                        if h % 10 < (10 - self.split):
+                            print("skipping current page for testing")
+                            continue
+
+                tokens = data["data"][page_idx]
+
+                # HWC.
+                # We hard code the padding to 0, thus image must in square (H:1344,W:1344 by default)
+                features = np.zeros(
+                    (self.img_size, self.img_size, self.dimensions),
+                    dtype=np.float32,
+                )
+
+                # make features, HWF
+                for token in tokens:
+                    # x1, y1, x2, y2 = xyxy_to_training(token["position"]["xyxy"])
+                    x1, y1, x2, y2 = [round(x) for x in token["position"]["xyxy"]]
+
+                    # token position mask
+                    features[y1:y2, x1:x2, 0] = 1
+
+                    for i, feature in enumerate(token["features"]):
+                        features[y1:y2, x1:x2, i + 1] = feature
+
+                # make labels
+                page_labels = []
+                for label in db["bboxes"].find(
+                    {
+                        "file_idx": file_idx,
+                        "page_idx": page_idx,
+                        "audited": True,
+                        "block_type": {"$in": list(self.labels_map.keys())},
+                    }
+                ):
+                    label_type = self.labels_map[label["block_type"]]
+
+                    try:
+                        xyxy = correct_box(features, label["bbox"])
+                    except Exception:
+                        continue
+
+                    label_coords = xyxy_to_training(
+                        xyxy, dim=(self.img_size, self.img_size)
+                    )
+
+                    labeled = [label_type] + label_coords
+
+                    page_labels.append(np.array(labeled))
+
+                if page_labels:
+                    self.imgs.append(features)
+
+                    self.img_files.append(f"file:{file_idx} page:{page_idx+1}")
+
+                    self.labels.append(page_labels)
+                    print(
+                        f"{len(page_labels)} labels for document {file_idx}, page {page_idx+1}"
+                    )
+
+        print(
+            f"Found {len(self.imgs)} images with {sum([len(x) for x in self.labels])} labels"
+        )
+
+        # label found, label missing, label empty, label corrupted, total label.
+        self.shapes = np.array(
+            [[x.shape[0], x.shape[1]] for x in self.imgs], dtype=np.float64
+        )
+        # convert to np array
+        self.labels = [np.array(x) for x in self.labels]
+        self.scaler = preprocessing.MinMaxScaler()
+        self.scaler.fit(np.array(self.imgs).reshape(-1,12))
+        
+        # self.scaler.fit(self.imgs)
+        n = len(self.imgs)  # number of images
         bi = np.floor(np.arange(n) / batch_size).astype(np.int)  # batch index
         nb = bi[-1] + 1  # number of batches
         self.batch = bi  # batch index of image
         self.n = n
         self.indices = range(n)
 
-        # Rectangular Training
-        if self.rect:
-            # Sort by aspect ratio
-            s = self.shapes  # wh
-            ar = s[:, 1] / s[:, 0]  # aspect ratio
-            irect = ar.argsort()
-            self.img_files = [self.img_files[i] for i in irect]
-            self.label_files = [self.label_files[i] for i in irect]
-            self.labels = [self.labels[i] for i in irect]
-            self.shapes = s[irect]  # wh
-            ar = ar[irect]
-
-            # Set training image shapes
-            shapes = [[1, 1]] * nb
-            for i in range(nb):
-                ari = ar[bi == i]
-                mini, maxi = ari.min(), ari.max()
-                if maxi < 1:
-                    shapes[i] = [maxi, 1]
-                elif mini > 1:
-                    shapes[i] = [1, 1 / mini]
-
-            self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(np.int) * stride
-
-        # Cache images into memory for faster training (WARNING: large datasets may exceed system RAM)
-        self.imgs, self.img_npy = [None] * n, [None] * n
-        if cache_images:
-            if cache_images == 'disk':
-                self.im_cache_dir = Path(Path(self.img_files[0]).parent.as_posix() + '_npy')
-                self.img_npy = [self.im_cache_dir / Path(f).with_suffix('.npy').name for f in self.img_files]
-                self.im_cache_dir.mkdir(parents=True, exist_ok=True)
-            gb = 0  # Gigabytes of cached images
-            self.img_hw0, self.img_hw = [None] * n, [None] * n
-            results = ThreadPool(NUM_THREADS).imap(lambda x: load_image(*x), zip(repeat(self), range(n)))
-            pbar = tqdm(enumerate(results), total=n)
-            for i, x in pbar:
-                if cache_images == 'disk':
-                    if not self.img_npy[i].exists():
-                        np.save(self.img_npy[i].as_posix(), x[0])
-                    gb += self.img_npy[i].stat().st_size
-                else:
-                    self.imgs[i], self.img_hw0[i], self.img_hw[i] = x  # im, hw_orig, hw_resized = load_image(self, i)
-                    gb += self.imgs[i].nbytes
-                pbar.desc = f'{prefix}Caching images ({gb / 1E9:.1f}GB {cache_images})'
-            pbar.close()
-
-    def cache_labels(self, path=Path('./labels.cache'), prefix=''):
-        # Cache dataset labels, check images and read shapes
-        x = {}  # dict
-        nm, nf, ne, nc, msgs = 0, 0, 0, 0, []  # number missing, found, empty, corrupt, messages
-        desc = f"{prefix}Scanning '{path.parent / path.stem}' images and labels..."
-        with Pool(NUM_THREADS) as pool:
-            pbar = tqdm(pool.imap_unordered(verify_image_label, zip(self.img_files, self.label_files, repeat(prefix))),
-                        desc=desc, total=len(self.img_files))
-            for im_file, l, shape, segments, nm_f, nf_f, ne_f, nc_f, msg in pbar:
-                nm += nm_f
-                nf += nf_f
-                ne += ne_f
-                nc += nc_f
-                if im_file:
-                    x[im_file] = [l, shape, segments]
-                if msg:
-                    msgs.append(msg)
-                pbar.desc = f"{desc}{nf} found, {nm} missing, {ne} empty, {nc} corrupted"
-
-        pbar.close()
-        if msgs:
-            logging.info('\n'.join(msgs))
-        if nf == 0:
-            logging.info(f'{prefix}WARNING: No labels found in {path}. See {HELP_URL}')
-        x['hash'] = get_hash(self.label_files + self.img_files)
-        x['results'] = nf, nm, ne, nc, len(self.img_files)
-        x['msgs'] = msgs  # warnings
-        x['version'] = 0.4  # cache version
-        try:
-            np.save(path, x)  # save cache for next time
-            path.with_suffix('.cache.npy').rename(path)  # remove .npy suffix
-            logging.info(f'{prefix}New cache created: {path}')
-        except Exception as e:
-            logging.info(f'{prefix}WARNING: Cache directory {path.parent} is not writeable: {e}')  # path not writeable
-        return x
-
     def __len__(self):
-        return len(self.img_files)
-
-    # def __iter__(self):
-    #     self.count = -1
-    #     print('ran dataset iter')
-    #     #self.shuffled_vector = np.random.permutation(self.nF) if self.augment else np.arange(self.nF)
-    #     return self
+        return len(self.imgs)
 
     def __getitem__(self, index):
         index = self.indices[index]  # linear, shuffled, or image_weights
+        img = self.imgs[index]
+        # img = self.scaler.transform([img])[0]
+        img = self.scaler.transform(img.reshape(-1,12)).reshape(1344,1344,12)
 
-        hyp = self.hyp
-        mosaic = self.mosaic and random.random() < hyp['mosaic']
-        if mosaic:
-            # Load mosaic
-            img, labels = load_mosaic(self, index)
-            shapes = None
+        # create shapes for plotting
+        h0, w0 = h, w = self.img_size, self.img_size
 
-            # MixUp augmentation
-            if random.random() < hyp['mixup']:
-                img, labels = mixup(img, labels, *load_mosaic(self, random.randint(0, self.n - 1)))
+        # orignal (h,w), (scale(h,w), padding(h,w)).
+        # NOTE: padding is hard coded to 0, thus we should have
+        # shape = (1344, 1344), ((1, 1), (0, 0))
+        shapes = (h0, w0), ((h / h0, w / w0), (0, 0))  # for COCO mAP rescaling
 
-        else:
-            # Load image
-            img, (h0, w0), (h, w) = load_image(self, index)
+        labels = self.labels[index]
+        nL = len(labels)  # number of labels
+        labels_out = torch.zeros((nL, 6))
+        labels_out[:, 1:] = torch.from_numpy(labels)
 
-            # Letterbox
-            shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
-            img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
-            shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
+        x = torch.from_numpy(img)
 
-            labels = self.labels[index].copy()
-            if labels.size:  # normalized xywh to pixel xyxy format
-                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+        # x = x[:, :, :1]
+        # x = torch.cat([x,x,x],dim=2)
+        # convert nlm features to yolo channels => BHWC to BCHW
+        # BHWC => BCWH
+        x = x.transpose(0, 2)
+        # BCWH => BCHW
+        x = x.transpose(1, 2)
 
-            if self.augment:
-                img, labels = random_perspective(img, labels,
-                                                 degrees=hyp['degrees'],
-                                                 translate=hyp['translate'],
-                                                 scale=hyp['scale'],
-                                                 shear=hyp['shear'],
-                                                 perspective=hyp['perspective'])
-
-        nl = len(labels)  # number of labels
-        if nl:
-            labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1E-3)
-
-        if self.augment:
-            # Albumentations
-            img, labels = self.albumentations(img, labels)
-
-            # HSV color-space
-            augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
-
-            # Flip up-down
-            if random.random() < hyp['flipud']:
-                img = np.flipud(img)
-                if nl:
-                    labels[:, 2] = 1 - labels[:, 2]
-
-            # Flip left-right
-            if random.random() < hyp['fliplr']:
-                img = np.fliplr(img)
-                if nl:
-                    labels[:, 1] = 1 - labels[:, 1]
-
-            # Cutouts
-            # labels = cutout(img, labels, p=0.5)
-
-        labels_out = torch.zeros((nl, 6))
-        if nl:
-            labels_out[:, 1:] = torch.from_numpy(labels)
-
-        # Convert
-        img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
-        img = np.ascontiguousarray(img)
-
-        return torch.from_numpy(img), labels_out, self.img_files[index], shapes
+        # print(x[1].shape)
+        # normalize to 0-1
+        x = x * 255
+        # print("img", x.shape)
+        # print("labels_out", len(labels_out))
+        # print("index", self.img_files[index].shape)
+        return x, labels_out, self.img_files[index], shapes
 
     @staticmethod
     def collate_fn(batch):
