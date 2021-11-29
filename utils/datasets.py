@@ -170,11 +170,11 @@ def exif_transpose(image):
     return image
 
 
-def create_dataloader(path, imgsz, batch_size, stride, single_cls=False, hyp=None, augment=False, cache=False, pad=0.0,
+def create_dataloader(path, split, imgsz, batch_size, stride, single_cls=False, hyp=None, augment=False, cache=False, pad=0.0,
                       rect=False, rank=-1, workers=8, image_weights=False, quad=False, prefix=''):
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
     with torch_distributed_zero_first(rank):
-        dataset = LoadImagesAndLabels(path, imgsz, batch_size,
+        dataset = LoadImagesAndLabels(path, split, imgsz, batch_size,
                                       augment=augment,  # augment images
                                       hyp=hyp,  # augmentation hyperparameters
                                       rect=rect,  # rectangular training
@@ -471,6 +471,7 @@ def img2label_paths(img_paths):
 class LoadImagesAndLabels(Dataset):  # for training/testing
     def __init__(
         self,
+        path,
         split,
         img_size=1344,
         batch_size=16,
@@ -506,10 +507,19 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         db_client = MongoClient(os.getenv("MONGO_HOST", "localhost"))
         db = db_client[os.getenv("MONGO_DATABASE", "doc-store-dev")]
 
+        import datetime
+        from bson.objectid import ObjectId
+        gen_time = datetime.datetime(2021, 11, 6)
+        dummy_id = ObjectId.from_datetime(gen_time)
+
         file_idxs = db["bboxes"].distinct(
             "file_idx",
-            {"audited": True, "block_type": {"$in": list(self.labels_map.keys())}},
+            {"audited": True, "block_type": {"$in": list(self.labels_map.keys())}, "_id": {"$gte": dummy_id}},
         )
+        # file_idxs = db["bboxes"].distinct(
+        #     "file_idx",
+        #     {"audited": True, "block_type": {"$in": list(self.labels_map.keys())}},
+        # )
 
         for file_idx in file_idxs:
             try:
@@ -530,26 +540,27 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     "file_idx": file_idx,
                     "audited": True,
                     "block_type": {"$in": list(self.labels_map.keys())},
+                    "split": self.split,
                 },
             )
             for page_idx in pages:
-                if self.split and isinstance(self.split, int):
-                    h = xxh32_intdigest(f"{file_idx}-{page_idx}")
-                    if self.split > 5:
-                        if h % 10 >= self.split:
-                            print("skipping current page for training")
-                            continue
-                    else:
-                        if h % 10 < (10 - self.split):
-                            print("skipping current page for testing")
-                            continue
+                # if self.split and isinstance(self.split, int):
+                #     h = xxh32_intdigest(f"{file_idx}-{page_idx}")
+                #     if self.split > 5:
+                #         if h % 10 >= self.split:
+                #             print("skipping current page for training")
+                #             continue
+                #     else:
+                #         if h % 10 < (10 - self.split):
+                #             print("skipping current page for testing")
+                #             continue
 
                 tokens = data["data"][page_idx]
 
                 # HWC.
                 # We hard code the padding to 0, thus image must in square (H:1344,W:1344 by default)
                 features = np.zeros(
-                    (self.img_size, self.img_size, self.dimensions),
+                    (self.img_size, self.img_size, 1),
                     dtype=np.float32,
                 )
 
@@ -561,8 +572,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     # token position mask
                     features[y1:y2, x1:x2, 0] = 1
 
-                    for i, feature in enumerate(token["features"]):
-                        features[y1:y2, x1:x2, i + 1] = feature
+                    # for i, feature in enumerate(token["features"]):
+                    #     features[y1:y2, x1:x2, i + 1] = feature
 
                 # make labels
                 page_labels = []
@@ -609,8 +620,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         )
         # convert to np array
         self.labels = [np.array(x) for x in self.labels]
-        self.scaler = preprocessing.MinMaxScaler()
-        self.scaler.fit(np.array(self.imgs).reshape(-1,12))
+        # self.scaler = preprocessing.MinMaxScaler()
+        # self.scaler.fit(np.array(self.imgs).reshape(-1,12))
         
         # self.scaler.fit(self.imgs)
         n = len(self.imgs)  # number of images
@@ -627,7 +638,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         index = self.indices[index]  # linear, shuffled, or image_weights
         img = self.imgs[index]
         # img = self.scaler.transform([img])[0]
-        img = self.scaler.transform(img.reshape(-1,12)).reshape(1344,1344,12)
+        # img = self.scaler.transform(img.reshape(-1,12)).reshape(1344,1344,12)
 
         # create shapes for plotting
         h0, w0 = h, w = self.img_size, self.img_size
